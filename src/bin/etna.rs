@@ -393,14 +393,14 @@ static CC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn usize_to_u8(x: usize) -> u8 {
     // crabcheck's Arbitrary<usize> yields values in 0..=log2(i+1) (max ~14 over
-    // a 20k-iteration run). Raw casting collapses every input into the control-
-    // character range, which `normalize_field` filters to empty and every
-    // property discards — we'd run 20k tests and touch no real byte. Spread the
-    // small input across an alphabet of printable ASCII, a few field-meaningful
-    // punctuation bytes, and 0xFF so invalid-UTF-8 cases still occur ~2% of
-    // the time for the deserialize-byte-buf property.
-    const TABLE: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF0123456789 _-.@,\n\xFF";
-    TABLE[x % TABLE.len()]
+    // a 20k-iteration run). Raw casting would collapse every input into the
+    // control-character range, which `normalize_field` filters to empty and
+    // every property silently discards. A modular alphabet lookup has the same
+    // problem — only the first ~14 slots are ever hit. Use a multiplicative
+    // hash to spread small usizes across the full byte range so alphanumeric,
+    // punctuation, and high (invalid-UTF-8) bytes all appear regularly.
+    let h = (x as u32).wrapping_mul(2654435761);
+    (h >> 24) as u8
 }
 
 fn usize_vec_to_u8_vec(v: Vec<usize>) -> Vec<u8> {
