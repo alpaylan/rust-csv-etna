@@ -37,9 +37,6 @@ pub struct ByteRecord(Box<ByteRecordInner>);
 
 impl PartialEq for ByteRecord {
     fn eq(&self, other: &ByteRecord) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
         self.iter().zip(other.iter()).all(|e| e.0 == e.1)
     }
 }
