@@ -40,7 +40,7 @@ impl PartialEq for ByteRecord {
         if self.len() != other.len() {
             return false;
         }
-        self.iter().zip(other.iter()).all(|e| e.0 == e.1)
+        self.as_slice() == other.as_slice()
     }
 }
 
