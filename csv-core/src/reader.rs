@@ -988,8 +988,6 @@ impl Reader {
             StartRecord => {
                 if self.term.equals(c) {
                     (StartRecord, NfaInputAction::Discard)
-                } else if self.comment == Some(c) {
-                    (InComment, NfaInputAction::Discard)
                 } else {
                     (StartField, NfaInputAction::Epsilon)
                 }
@@ -1002,6 +1000,8 @@ impl Reader {
                     (EndFieldDelim, NfaInputAction::Discard)
                 } else if self.term.equals(c) {
                     (EndFieldTerm, NfaInputAction::Epsilon)
+                } else if self.comment == Some(c) {
+                    (InComment, NfaInputAction::Discard)
                 } else {
                     (InField, NfaInputAction::CopyToOutput)
                 }
