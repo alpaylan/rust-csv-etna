@@ -484,7 +484,6 @@ impl Reader {
         self.nfa_state = NfaState::StartRecord;
         self.line = 1;
         self.has_read = false;
-        self.output_pos = 0;
     }
 
     /// Return the current line number as measured by the number of occurrences
