@@ -93,12 +93,26 @@ fn run_etna_property(property: &str) -> Outcome {
         "WriterCommentCharAutoQuote" => {
             to_err(property_writer_comment_char_auto_quote(b" comment".to_vec()))
         }
-        "ByteRecordEqMatchesFields" => to_err(property_byte_record_eq_matches_fields(
-            b"1234".to_vec(),
-            vec![2],
-            vec![3],
-            0,
-        )),
+        "ByteRecordEqMatchesFields" => {
+            // Two variants share this property (boundary + length). Run both
+            // witnesses so etna replay flags either bug.
+            let boundary = property_byte_record_eq_matches_fields(
+                b"1234".to_vec(),
+                vec![2],
+                vec![3],
+                0,
+            );
+            let length = property_byte_record_eq_matches_fields(
+                b"123456".to_vec(),
+                vec![2, 4],
+                vec![2, 4],
+                2,
+            );
+            match (boundary, length) {
+                (PropertyResult::Fail(m), _) | (_, PropertyResult::Fail(m)) => Err(m),
+                _ => Ok(()),
+            }
+        }
         "CommentOnlyAtRecordStart" => {
             to_err(property_comment_only_at_record_start(b"bar".to_vec()))
         }
