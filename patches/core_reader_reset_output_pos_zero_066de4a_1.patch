@@ -1,0 +1,12 @@
+diff --git a/csv-core/src/reader.rs b/csv-core/src/reader.rs
+index 5bcbdfa..0647f98 100644
+--- a/csv-core/src/reader.rs
++++ b/csv-core/src/reader.rs
+@@ -484,7 +484,6 @@ impl Reader {
+         self.nfa_state = NfaState::StartRecord;
+         self.line = 1;
+         self.has_read = false;
+-        self.output_pos = 0;
+     }
+ 
+     /// Return the current line number as measured by the number of occurrences

@@ -1,0 +1,18 @@
+diff --git a/csv-core/src/writer.rs b/csv-core/src/writer.rs
+index 011ab06..3e205ac 100644
+--- a/csv-core/src/writer.rs
++++ b/csv-core/src/writer.rs
+@@ -56,13 +56,6 @@ impl WriterBuilder {
+                 wtr.requires_quotes[b as usize] = true;
+             }
+         }
+-        // If the first field of a row starts with a comment character,
+-        // it needs to be quoted, or the row will not be readable later.
+-        // As requires_quotes is calculated in advance, we force quotes
+-        // when a comment character is encountered anywhere in the field.
+-        if let Some(comment) = self.wtr.comment {
+-            wtr.requires_quotes[comment as usize] = true;
+-        }
+         wtr
+     }
+ 

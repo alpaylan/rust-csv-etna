@@ -1,0 +1,14 @@
+diff --git a/src/byte_record.rs b/src/byte_record.rs
+index c6c196e..9370616 100644
+--- a/src/byte_record.rs
++++ b/src/byte_record.rs
+@@ -37,9 +37,6 @@ pub struct ByteRecord(Box<ByteRecordInner>);
+ 
+ impl PartialEq for ByteRecord {
+     fn eq(&self, other: &ByteRecord) -> bool {
+-        if self.len() != other.len() {
+-            return false;
+-        }
+         self.iter().zip(other.iter()).all(|e| e.0 == e.1)
+     }
+ }

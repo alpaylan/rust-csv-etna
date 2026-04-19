@@ -1,0 +1,13 @@
+diff --git a/src/byte_record.rs b/src/byte_record.rs
+index c6c196e..4aa23be 100644
+--- a/src/byte_record.rs
++++ b/src/byte_record.rs
+@@ -40,7 +40,7 @@ impl PartialEq for ByteRecord {
+         if self.len() != other.len() {
+             return false;
+         }
+-        self.iter().zip(other.iter()).all(|e| e.0 == e.1)
++        self.as_slice() == other.as_slice()
+     }
+ }
+ 
