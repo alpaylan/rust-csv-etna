@@ -207,31 +207,62 @@ pub fn property_writer_comment_char_auto_quote(tail: Vec<u8>) -> PropertyResult 
 // ──────────────────────────────────────────────────────────────────────────
 // Property 4/5: ByteRecord equality respects field boundaries and length.
 //
-// Regression for efc4a51 (field boundaries) and 23fb0cd (length check). One
-// property detects both bugs:
-//   r1 == r2  ⇔  left == right  (vec equality)
+// Regression for efc4a51 (field boundaries) and 23fb0cd (length check). Input
+// is shaped so random PBT can reach both bug patterns:
+//   left  = split(base, splits_a)
+//   right = split(base[..base.len()-trunc_b], splits_b)
+//
+// Shared `base` means `r1.as_slice() == r2.as_slice()` is common, which
+// exercises the boundary bug when splits differ. Non-zero `trunc_b` yields
+// records of differing lengths that still share a common prefix of fields,
+// which exercises the length-guard bug.
+//
+// Invariant: `r1 == r2  ⇔  fields(r1) == fields(r2)` (vec equality).
 // ──────────────────────────────────────────────────────────────────────────
+fn split_bytes(bytes: &[u8], splits: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut positions: Vec<usize> = splits
+        .iter()
+        .take(4)
+        .map(|&s| (s as usize) % (bytes.len() + 1))
+        .filter(|&p| p > 0 && p < bytes.len())
+        .collect();
+    positions.sort();
+    positions.dedup();
+    let mut out = Vec::with_capacity(positions.len() + 1);
+    let mut prev = 0usize;
+    for p in &positions {
+        out.push(bytes[prev..*p].to_vec());
+        prev = *p;
+    }
+    out.push(bytes[prev..].to_vec());
+    out
+}
+
 pub fn property_byte_record_eq_matches_fields(
-    left: Vec<Vec<u8>>,
-    right: Vec<Vec<u8>>,
+    base: Vec<u8>,
+    splits_a: Vec<u8>,
+    splits_b: Vec<u8>,
+    trunc_b: u8,
 ) -> PropertyResult {
-    // Cap sizes to keep things fast.
-    if left.len() > 6 || right.len() > 6 {
+    if base.len() > 16 {
         return PropertyResult::Discard;
     }
-    for v in left.iter().chain(right.iter()) {
-        if v.len() > 8 {
-            return PropertyResult::Discard;
-        }
-    }
+    let base_a = &base[..];
+    let trunc = (trunc_b as usize) % (base.len() + 1);
+    let base_b = &base[..base.len() - trunc];
+    let left = split_bytes(base_a, &splits_a);
+    let right = split_bytes(base_b, &splits_b);
     let r1 = ByteRecord::from(left.clone());
     let r2 = ByteRecord::from(right.clone());
     let expected = left == right;
     let actual = r1 == r2;
     if expected != actual {
         return PropertyResult::Fail(format!(
-            "left={:?} right={:?} expected_eq={} got_eq={}",
-            left, right, expected, actual
+            "base={:?} splits_a={:?} splits_b={:?} trunc_b={} left={:?} right={:?} expected_eq={} got_eq={}",
+            base, splits_a, splits_b, trunc_b, left, right, expected, actual
         ));
     }
     PropertyResult::Pass

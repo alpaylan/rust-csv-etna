@@ -94,8 +94,10 @@ fn run_etna_property(property: &str) -> Outcome {
             to_err(property_writer_comment_char_auto_quote(b" comment".to_vec()))
         }
         "ByteRecordEqMatchesFields" => to_err(property_byte_record_eq_matches_fields(
-            vec![b"12".to_vec(), b"34".to_vec()],
-            vec![b"123".to_vec(), b"4".to_vec()],
+            b"1234".to_vec(),
+            vec![2],
+            vec![3],
+            0,
         )),
         "CommentOnlyAtRecordStart" => {
             to_err(property_comment_only_at_record_start(b"bar".to_vec()))
@@ -169,14 +171,23 @@ fn run_proptest_property(property: &str) -> Outcome {
         }
         "ByteRecordEqMatchesFields" => {
             let c = counter.clone();
+            let splits_strategy = prop::collection::vec(any::<u8>(), 0..5);
             runner
-                .run(&(vec_bytes_strategy(), vec_bytes_strategy()), move |(a, b)| {
-                    c.fetch_add(1, Ordering::Relaxed);
-                    match property_byte_record_eq_matches_fields(a, b) {
-                        PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
-                    }
-                })
+                .run(
+                    &(
+                        bytes_strategy(),
+                        splits_strategy.clone(),
+                        splits_strategy,
+                        any::<u8>(),
+                    ),
+                    move |(base, sa, sb, trunc)| {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        match property_byte_record_eq_matches_fields(base, sa, sb, trunc) {
+                            PropertyResult::Pass | PropertyResult::Discard => Ok(()),
+                            PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
+                        }
+                    },
+                )
                 .map_err(|e| e.to_string())
         }
         "CommentOnlyAtRecordStart" => {
@@ -282,9 +293,25 @@ fn qc_writer_comment_char_auto_quote(seed: u64) -> TestResult {
     }
 }
 
+fn seed_to_splits(seed: u64) -> Vec<u8> {
+    // Up to 4 split positions drawn from the seed.
+    let n = ((seed >> 60) as usize) % 5;
+    let mut out = Vec::with_capacity(n);
+    let mut s = seed;
+    for _ in 0..n {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push((s >> 56) as u8);
+    }
+    out
+}
+
 fn qc_byte_record_eq_matches_fields(a: u64, b: u64) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_byte_record_eq_matches_fields(seed_to_byte_fields(a), seed_to_byte_fields(b)) {
+    let base = seed_to_bytes(a);
+    let splits_a = seed_to_splits(a ^ 0xA5A5_5A5A_5A5A_A5A5);
+    let splits_b = seed_to_splits(b);
+    let trunc_b = ((b >> 56) as u8) / 32;
+    match property_byte_record_eq_matches_fields(base, splits_a, splits_b, trunc_b) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
@@ -365,7 +392,15 @@ fn run_quickcheck_property(property: &str) -> Outcome {
 static CC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn usize_to_u8(x: usize) -> u8 {
-    (x as u64 & 0xFF) as u8
+    // crabcheck's Arbitrary<usize> yields values in 0..=log2(i+1) (max ~14 over
+    // a 20k-iteration run). Raw casting collapses every input into the control-
+    // character range, which `normalize_field` filters to empty and every
+    // property discards — we'd run 20k tests and touch no real byte. Spread the
+    // small input across an alphabet of printable ASCII, a few field-meaningful
+    // punctuation bytes, and 0xFF so invalid-UTF-8 cases still occur ~2% of
+    // the time for the deserialize-byte-buf property.
+    const TABLE: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF0123456789 _-.@,\n\xFF";
+    TABLE[x % TABLE.len()]
 }
 
 fn usize_vec_to_u8_vec(v: Vec<usize>) -> Vec<u8> {
@@ -404,12 +439,14 @@ fn cc_writer_comment_char_auto_quote(v: Vec<usize>) -> Option<bool> {
 }
 
 fn cc_byte_record_eq_matches_fields(
-    (a, b): (Vec<Vec<usize>>, Vec<Vec<usize>>),
+    (base, sa, sb, trunc): (Vec<usize>, Vec<usize>, Vec<usize>, usize),
 ) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
     match property_byte_record_eq_matches_fields(
-        nested_usize_to_u8(a),
-        nested_usize_to_u8(b),
+        usize_vec_to_u8_vec(base),
+        usize_vec_to_u8_vec(sa),
+        usize_vec_to_u8_vec(sb),
+        usize_to_u8(trunc),
     ) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
@@ -537,13 +574,13 @@ fn run_hegel_property(property: &str) -> Outcome {
         "ByteRecordEqMatchesFields" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let a = tc.draw(
-                    hgen::vecs(hgen::vecs(hgen::integers::<u8>()).max_size(6)).max_size(5),
-                );
-                let b = tc.draw(
-                    hgen::vecs(hgen::vecs(hgen::integers::<u8>()).max_size(6)).max_size(5),
-                );
-                if let PropertyResult::Fail(m) = property_byte_record_eq_matches_fields(a, b) {
+                let base = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(16));
+                let splits_a = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(4));
+                let splits_b = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(4));
+                let trunc_b = tc.draw(hgen::integers::<u8>());
+                if let PropertyResult::Fail(m) =
+                    property_byte_record_eq_matches_fields(base, splits_a, splits_b, trunc_b)
+                {
                     panic!("{m}");
                 }
             })

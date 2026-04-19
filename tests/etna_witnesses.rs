@@ -52,24 +52,33 @@ fn witness_writer_comment_char_auto_quote_case_hash_prefix() {
 }
 
 // Variant: byte_record_eq_field_boundaries_efc4a51_1
+// left = split("1234", [2]) = ["12","34"]; right = split("1234", [3]) = ["123","4"].
+// Same base → records share as_slice(); boundary bug makes eq return true.
 #[test]
 fn witness_byte_record_eq_matches_fields_case_boundary_shift() {
     expect_pass(
         property_byte_record_eq_matches_fields(
-            vec![b"12".to_vec(), b"34".to_vec()],
-            vec![b"123".to_vec(), b"4".to_vec()],
+            b"1234".to_vec(),
+            vec![2],
+            vec![3],
+            0,
         ),
         "byte_record_eq / boundary_shift",
     );
 }
 
 // Variant: byte_record_eq_length_check_23fb0cd_1
+// left = split("123456", [2,4]) = ["12","34","56"];
+// right = split("1234", [2,4]) = ["12","34"] (trunc=2 drops "56").
+// Length bug makes zip-over-shorter-iterator return true.
 #[test]
 fn witness_byte_record_eq_matches_fields_case_length_mismatch() {
     expect_pass(
         property_byte_record_eq_matches_fields(
-            vec![b"12".to_vec(), b"34".to_vec(), b"56".to_vec()],
-            vec![b"12".to_vec(), b"34".to_vec()],
+            b"123456".to_vec(),
+            vec![2, 4],
+            vec![2, 4],
+            2,
         ),
         "byte_record_eq / length_mismatch",
     );
