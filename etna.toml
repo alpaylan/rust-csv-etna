@@ -1,5 +1,6 @@
 name = "rust-csv"
 language = "rust"
+strategies = ["proptest", "quickcheck", "crabcheck", "hegel"]
 crate = "csv"
 base_commit = "9e44eba92b797e50f03924147dcda884476fbc9a"
 
