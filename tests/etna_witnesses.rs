@@ -45,8 +45,13 @@ fn witness_trim_all_applies_without_headers_case_three_fields() {
 // Variant: writer_comment_char_auto_quote_0f64d3f_1
 #[test]
 fn witness_writer_comment_char_auto_quote_case_hash_prefix() {
+    // comment_byte=0 → pick_comment_byte → '#'; tail=" comment" makes field "# comment".
     expect_pass(
-        property_writer_comment_char_auto_quote(b" comment".to_vec()),
+        property_writer_comment_char_auto_quote(
+            b" comment".to_vec(),
+            b"after".to_vec(),
+            0u8,
+        ),
         "writer_comment_char_auto_quote / hash_prefix",
     );
 }
@@ -87,8 +92,14 @@ fn witness_byte_record_eq_matches_fields_case_length_mismatch() {
 // Variant: core_reader_comment_only_at_record_start_a5745ba_1
 #[test]
 fn witness_comment_only_at_record_start_case_mid_record_hash() {
+    // comment_byte=0 → pick_comment_byte → '#'; first="first", tail="bar" yields
+    // "first,#bar\n" which exercises the mid-record comment trigger.
     expect_pass(
-        property_comment_only_at_record_start(b"bar".to_vec()),
+        property_comment_only_at_record_start(
+            b"first".to_vec(),
+            b"bar".to_vec(),
+            0u8,
+        ),
         "comment_only_at_record_start / mid_record_hash",
     );
 }

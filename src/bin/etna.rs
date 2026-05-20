@@ -14,6 +14,7 @@
 // (usage errors exit 2).
 
 use crabcheck::quickcheck as crabcheck_qc;
+use crabcheck::quickcheck::Arbitrary as CcArbitrary;
 use csv::etna::{
     property_byte_record_eq_matches_fields, property_comment_only_at_record_start,
     property_deserialize_byte_buf_accepts_non_utf8, property_reset_clears_output_position,
@@ -22,8 +23,10 @@ use csv::etna::{
 };
 use hegel::{generators as hgen, Hegel, Settings as HegelSettings};
 use proptest::prelude::*;
-use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
-use quickcheck::{QuickCheck, ResultStatus, TestResult};
+use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestError, TestRunner};
+use quickcheck::{Arbitrary as QcArbitrary, Gen, QuickCheck, ResultStatus, TestResult};
+use rand::Rng;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -91,7 +94,11 @@ fn run_etna_property(property: &str) -> Outcome {
             ]))
         }
         "WriterCommentCharAutoQuote" => {
-            to_err(property_writer_comment_char_auto_quote(b" comment".to_vec()))
+            to_err(property_writer_comment_char_auto_quote(
+                b" comment".to_vec(),
+                b"after".to_vec(),
+                0u8,
+            ))
         }
         "ByteRecordEqMatchesFields" => {
             // Two variants share this property (boundary + length). Run both
@@ -114,7 +121,11 @@ fn run_etna_property(property: &str) -> Outcome {
             }
         }
         "CommentOnlyAtRecordStart" => {
-            to_err(property_comment_only_at_record_start(b"bar".to_vec()))
+            to_err(property_comment_only_at_record_start(
+                b"first".to_vec(),
+                b"bar".to_vec(),
+                0u8,
+            ))
         }
         "DeserializeByteBufAcceptsNonUtf8" => to_err(
             property_deserialize_byte_buf_accepts_non_utf8(b"foo\xFFbar".to_vec()),
@@ -128,6 +139,102 @@ fn run_etna_property(property: &str) -> Outcome {
     };
     let elapsed_us = t0.elapsed().as_micros();
     (result, Metrics { inputs: 1, elapsed_us })
+}
+
+// ───────────── shared generators ─────────────
+//
+// Match proptest shapes exactly:
+//   Bytes24:    vec(any::<u8>(), 0..24)            → len 0..=23
+//   Splits5:    vec(any::<u8>(), 0..5)             → len 0..=4
+//   ByteFields: vec(vec(any::<u8>(), 0..6), 0..5)  → outer 0..=4, inner 0..=5
+
+#[derive(Clone)]
+struct Bytes24(Vec<u8>);
+
+#[derive(Clone)]
+struct Splits5(Vec<u8>);
+
+#[derive(Clone)]
+struct ByteFields(Vec<Vec<u8>>);
+
+macro_rules! impl_debug_display_delegate {
+    ($ty:ty) => {
+        impl fmt::Debug for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+    };
+}
+
+impl_debug_display_delegate!(Bytes24);
+impl_debug_display_delegate!(Splits5);
+impl_debug_display_delegate!(ByteFields);
+
+fn gen_bytes_qc(g: &mut Gen, max_len_exclusive: u32) -> Vec<u8> {
+    let len = g.random_range(0..max_len_exclusive) as usize;
+    let mut v = Vec::with_capacity(len);
+    for _ in 0..len {
+        v.push(g.random_range(0..=u8::MAX));
+    }
+    v
+}
+
+fn gen_bytes_cc<R: Rng>(rng: &mut R, max_len_exclusive: u32) -> Vec<u8> {
+    let len = rng.random_range(0..max_len_exclusive) as usize;
+    let mut v = Vec::with_capacity(len);
+    for _ in 0..len {
+        v.push(rng.random_range(0..=u8::MAX));
+    }
+    v
+}
+
+impl QcArbitrary for Bytes24 {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Bytes24(gen_bytes_qc(g, 24))
+    }
+}
+impl<R: Rng> CcArbitrary<R> for Bytes24 {
+    fn generate(rng: &mut R, _n: usize) -> Self {
+        Bytes24(gen_bytes_cc(rng, 24))
+    }
+}
+
+impl QcArbitrary for Splits5 {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Splits5(gen_bytes_qc(g, 5))
+    }
+}
+impl<R: Rng> CcArbitrary<R> for Splits5 {
+    fn generate(rng: &mut R, _n: usize) -> Self {
+        Splits5(gen_bytes_cc(rng, 5))
+    }
+}
+
+impl QcArbitrary for ByteFields {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let outer = g.random_range(0..5u32) as usize;
+        let mut out = Vec::with_capacity(outer);
+        for _ in 0..outer {
+            out.push(gen_bytes_qc(g, 6));
+        }
+        ByteFields(out)
+    }
+}
+impl<R: Rng> CcArbitrary<R> for ByteFields {
+    fn generate(rng: &mut R, _n: usize) -> Self {
+        let outer = rng.random_range(0..5u32) as usize;
+        let mut out = Vec::with_capacity(outer);
+        for _ in 0..outer {
+            out.push(gen_bytes_cc(rng, 6));
+        }
+        ByteFields(out)
+    }
 }
 
 // ───────────── proptest ─────────────
@@ -145,43 +252,53 @@ fn run_proptest_property(property: &str) -> Outcome {
     }
     let counter = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
-    let mut runner = TestRunner::new(ProptestConfig::default());
+    let mut runner = TestRunner::new(ProptestConfig { cases: 40_000_000, ..ProptestConfig::default() });
     let result: Result<(), String> = match property {
         "ResetClearsOutputPosition" => {
             let c = counter.clone();
             runner
                 .run(&bytes_strategy(), move |v| {
                     c.fetch_add(1, Ordering::Relaxed);
+                    let v_cex = v.clone();
                     match property_reset_clears_output_position(v) {
                         PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
+                        PropertyResult::Fail(_) => Err(TestCaseError::fail(format!("({:?})", v_cex))),
                     }
                 })
-                .map_err(|e| e.to_string())
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         "TrimAllAppliesWithoutHeaders" => {
             let c = counter.clone();
             runner
                 .run(&vec_bytes_strategy(), move |v| {
                     c.fetch_add(1, Ordering::Relaxed);
+                    let v_cex = v.clone();
                     match property_trim_all_applies_without_headers(v) {
                         PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
+                        PropertyResult::Fail(_) => Err(TestCaseError::fail(format!("({:?})", v_cex))),
                     }
                 })
-                .map_err(|e| e.to_string())
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         "WriterCommentCharAutoQuote" => {
             let c = counter.clone();
             runner
-                .run(&bytes_strategy(), move |v| {
-                    c.fetch_add(1, Ordering::Relaxed);
-                    match property_writer_comment_char_auto_quote(v) {
-                        PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
-                    }
-                })
-                .map_err(|e| e.to_string())
+                .run(
+                    &(bytes_strategy(), bytes_strategy(), any::<u8>()),
+                    move |(tail, after, comment)| {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        let tail_cex = tail.clone();
+                        let after_cex = after.clone();
+                        match property_writer_comment_char_auto_quote(tail, after, comment) {
+                            PropertyResult::Pass | PropertyResult::Discard => Ok(()),
+                            PropertyResult::Fail(_) => Err(TestCaseError::fail(format!(
+                                "({:?} {:?} {})",
+                                tail_cex, after_cex, comment
+                            ))),
+                        }
+                    },
+                )
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         "ByteRecordEqMatchesFields" => {
             let c = counter.clone();
@@ -196,37 +313,49 @@ fn run_proptest_property(property: &str) -> Outcome {
                     ),
                     move |(base, sa, sb, trunc)| {
                         c.fetch_add(1, Ordering::Relaxed);
+                        let base_cex = base.clone();
+                        let sa_cex = sa.clone();
+                        let sb_cex = sb.clone();
                         match property_byte_record_eq_matches_fields(base, sa, sb, trunc) {
                             PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                            PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
+                            PropertyResult::Fail(_) => Err(TestCaseError::fail(format!("({:?} {:?} {:?} {})", base_cex, sa_cex, sb_cex, trunc))),
                         }
                     },
                 )
-                .map_err(|e| e.to_string())
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         "CommentOnlyAtRecordStart" => {
             let c = counter.clone();
             runner
-                .run(&bytes_strategy(), move |v| {
-                    c.fetch_add(1, Ordering::Relaxed);
-                    match property_comment_only_at_record_start(v) {
-                        PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
-                    }
-                })
-                .map_err(|e| e.to_string())
+                .run(
+                    &(bytes_strategy(), bytes_strategy(), any::<u8>()),
+                    move |(first, tail, comment)| {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        let first_cex = first.clone();
+                        let tail_cex = tail.clone();
+                        match property_comment_only_at_record_start(first, tail, comment) {
+                            PropertyResult::Pass | PropertyResult::Discard => Ok(()),
+                            PropertyResult::Fail(_) => Err(TestCaseError::fail(format!(
+                                "({:?} {:?} {})",
+                                first_cex, tail_cex, comment
+                            ))),
+                        }
+                    },
+                )
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         "DeserializeByteBufAcceptsNonUtf8" => {
             let c = counter.clone();
             runner
                 .run(&bytes_strategy(), move |v| {
                     c.fetch_add(1, Ordering::Relaxed);
+                    let v_cex = v.clone();
                     match property_deserialize_byte_buf_accepts_non_utf8(v) {
                         PropertyResult::Pass | PropertyResult::Discard => Ok(()),
-                        PropertyResult::Fail(m) => Err(TestCaseError::fail(m)),
+                        PropertyResult::Fail(_) => Err(TestCaseError::fail(format!("({:?})", v_cex))),
                     }
                 })
-                .map_err(|e| e.to_string())
+                .map_err(|e| match e { TestError::Fail(reason, _) => reason.to_string(), other => other.to_string() })
         }
         _ => {
             return (
@@ -241,109 +370,69 @@ fn run_proptest_property(property: &str) -> Outcome {
 }
 
 // ───────────── quickcheck (fork with `etna` feature) ─────────────
-//
-// The etna feature on QuickCheck's Testable impl requires `Display` on every
-// argument, which `Vec<u8>` does not implement. So the adapters take scalar
-// seeds (u64) and expand them deterministically into the Vec<u8> / Vec<Vec<u8>>
-// inputs that the `property_*` functions consume. This matches how other
-// workloads (bitvec-rs, unicode-segmentation) handle the same constraint.
 static QC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn seed_to_bytes(seed: u64) -> Vec<u8> {
-    let len = ((seed >> 56) as usize) % 24 + 1;
-    let mut out = Vec::with_capacity(len);
-    let mut s = seed;
-    for _ in 0..len {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        out.push((s >> 33) as u8);
-    }
-    out
-}
-
-fn seed_to_byte_fields(seed: u64) -> Vec<Vec<u8>> {
-    let nfields = ((seed >> 60) as usize) % 5 + 1;
-    let mut out = Vec::with_capacity(nfields);
-    let mut s = seed;
-    for i in 0..nfields {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let flen = ((s >> 58) as usize) % 6 + 1;
-        let mut field = Vec::with_capacity(flen);
-        for j in 0..flen {
-            s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
-            let b = (s >> 33) as u8;
-            // Keep mostly-printable bytes so TrimAll etc. don't always discard.
-            let b = if b == 0 { b'a' + ((i as u8).wrapping_add(j as u8) % 26) } else { b };
-            field.push(b);
-        }
-        out.push(field);
-    }
-    out
-}
-
-fn qc_reset_clears_output_position(seed: u64) -> TestResult {
+fn qc_reset_clears_output_position(Bytes24(v): Bytes24) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_reset_clears_output_position(seed_to_bytes(seed)) {
+    match property_reset_clears_output_position(v) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
     }
 }
 
-fn qc_trim_all_applies_without_headers(seed: u64) -> TestResult {
+fn qc_trim_all_applies_without_headers(ByteFields(v): ByteFields) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_trim_all_applies_without_headers(seed_to_byte_fields(seed)) {
+    match property_trim_all_applies_without_headers(v) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
     }
 }
 
-fn qc_writer_comment_char_auto_quote(seed: u64) -> TestResult {
+fn qc_writer_comment_char_auto_quote(
+    Bytes24(tail): Bytes24,
+    Bytes24(after): Bytes24,
+    comment: u8,
+) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_writer_comment_char_auto_quote(seed_to_bytes(seed)) {
+    match property_writer_comment_char_auto_quote(tail, after, comment) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
     }
 }
 
-fn seed_to_splits(seed: u64) -> Vec<u8> {
-    // Up to 4 split positions drawn from the seed.
-    let n = ((seed >> 60) as usize) % 5;
-    let mut out = Vec::with_capacity(n);
-    let mut s = seed;
-    for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        out.push((s >> 56) as u8);
-    }
-    out
-}
-
-fn qc_byte_record_eq_matches_fields(a: u64, b: u64) -> TestResult {
+fn qc_byte_record_eq_matches_fields(
+    Bytes24(base): Bytes24,
+    Splits5(sa): Splits5,
+    Splits5(sb): Splits5,
+    trunc: u8,
+) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base = seed_to_bytes(a);
-    let splits_a = seed_to_splits(a ^ 0xA5A5_5A5A_5A5A_A5A5);
-    let splits_b = seed_to_splits(b);
-    let trunc_b = ((b >> 56) as u8) / 32;
-    match property_byte_record_eq_matches_fields(base, splits_a, splits_b, trunc_b) {
+    match property_byte_record_eq_matches_fields(base, sa, sb, trunc) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
     }
 }
 
-fn qc_comment_only_at_record_start(seed: u64) -> TestResult {
+fn qc_comment_only_at_record_start(
+    Bytes24(first): Bytes24,
+    Bytes24(tail): Bytes24,
+    comment: u8,
+) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_comment_only_at_record_start(seed_to_bytes(seed)) {
+    match property_comment_only_at_record_start(first, tail, comment) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
     }
 }
 
-fn qc_deserialize_byte_buf_accepts_non_utf8(seed: u64) -> TestResult {
+fn qc_deserialize_byte_buf_accepts_non_utf8(Bytes24(v): Bytes24) -> TestResult {
     QC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_deserialize_byte_buf_accepts_non_utf8(seed_to_bytes(seed)) {
+    match property_deserialize_byte_buf_accepts_non_utf8(v) {
         PropertyResult::Pass => TestResult::passed(),
         PropertyResult::Discard => TestResult::discard(),
         PropertyResult::Fail(_) => TestResult::failed(),
@@ -356,26 +445,26 @@ fn run_quickcheck_property(property: &str) -> Outcome {
     }
     QC_COUNTER.store(0, Ordering::Relaxed);
     let t0 = Instant::now();
-    let mut qc = QuickCheck::new().tests(200).max_tests(2000);
+    let mut qc = QuickCheck::new().tests(40_000_000).max_tests(80_000_000);
     let result = match property {
         "ResetClearsOutputPosition" => {
-            qc.quicktest(qc_reset_clears_output_position as fn(u64) -> TestResult)
+            qc.quicktest(qc_reset_clears_output_position as fn(Bytes24) -> TestResult)
         }
         "TrimAllAppliesWithoutHeaders" => {
-            qc.quicktest(qc_trim_all_applies_without_headers as fn(u64) -> TestResult)
+            qc.quicktest(qc_trim_all_applies_without_headers as fn(ByteFields) -> TestResult)
         }
-        "WriterCommentCharAutoQuote" => {
-            qc.quicktest(qc_writer_comment_char_auto_quote as fn(u64) -> TestResult)
-        }
-        "ByteRecordEqMatchesFields" => {
-            qc.quicktest(qc_byte_record_eq_matches_fields as fn(u64, u64) -> TestResult)
-        }
-        "CommentOnlyAtRecordStart" => {
-            qc.quicktest(qc_comment_only_at_record_start as fn(u64) -> TestResult)
-        }
-        "DeserializeByteBufAcceptsNonUtf8" => {
-            qc.quicktest(qc_deserialize_byte_buf_accepts_non_utf8 as fn(u64) -> TestResult)
-        }
+        "WriterCommentCharAutoQuote" => qc.quicktest(
+            qc_writer_comment_char_auto_quote as fn(Bytes24, Bytes24, u8) -> TestResult,
+        ),
+        "ByteRecordEqMatchesFields" => qc.quicktest(
+            qc_byte_record_eq_matches_fields as fn(Bytes24, Splits5, Splits5, u8) -> TestResult,
+        ),
+        "CommentOnlyAtRecordStart" => qc.quicktest(
+            qc_comment_only_at_record_start as fn(Bytes24, Bytes24, u8) -> TestResult,
+        ),
+        "DeserializeByteBufAcceptsNonUtf8" => qc.quicktest(
+            qc_deserialize_byte_buf_accepts_non_utf8 as fn(Bytes24) -> TestResult,
+        ),
         _ => {
             return (
                 Err(format!("Unknown property for quickcheck: {property}")),
@@ -389,7 +478,7 @@ fn run_quickcheck_property(property: &str) -> Outcome {
     let status = match result.status {
         ResultStatus::Finished => Ok(()),
         ResultStatus::Failed { arguments } => Err(format!(
-            "quickcheck counterexample: ({})",
+            "({})",
             arguments.join(" ")
         )),
         ResultStatus::Aborted { err } => Err(format!("quickcheck aborted: {err:?}")),
@@ -405,47 +494,29 @@ fn run_quickcheck_property(property: &str) -> Outcome {
 // ───────────── crabcheck ─────────────
 static CC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn usize_to_u8(x: usize) -> u8 {
-    // crabcheck's Arbitrary<usize> yields values in 0..=log2(i+1) (max ~14 over
-    // a 20k-iteration run). Raw casting would collapse every input into the
-    // control-character range, which `normalize_field` filters to empty and
-    // every property silently discards. A modular alphabet lookup has the same
-    // problem — only the first ~14 slots are ever hit. Use a multiplicative
-    // hash to spread small usizes across the full byte range so alphanumeric,
-    // punctuation, and high (invalid-UTF-8) bytes all appear regularly.
-    let h = (x as u32).wrapping_mul(2654435761);
-    (h >> 24) as u8
-}
-
-fn usize_vec_to_u8_vec(v: Vec<usize>) -> Vec<u8> {
-    v.into_iter().map(usize_to_u8).collect()
-}
-
-fn nested_usize_to_u8(v: Vec<Vec<usize>>) -> Vec<Vec<u8>> {
-    v.into_iter().map(usize_vec_to_u8_vec).collect()
-}
-
-fn cc_reset_clears_output_position(v: Vec<usize>) -> Option<bool> {
+fn cc_reset_clears_output_position(Bytes24(v): Bytes24) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_reset_clears_output_position(usize_vec_to_u8_vec(v)) {
+    match property_reset_clears_output_position(v) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
     }
 }
 
-fn cc_trim_all_applies_without_headers(v: Vec<Vec<usize>>) -> Option<bool> {
+fn cc_trim_all_applies_without_headers(ByteFields(v): ByteFields) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_trim_all_applies_without_headers(nested_usize_to_u8(v)) {
+    match property_trim_all_applies_without_headers(v) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
     }
 }
 
-fn cc_writer_comment_char_auto_quote(v: Vec<usize>) -> Option<bool> {
+fn cc_writer_comment_char_auto_quote(
+    (Bytes24(tail), Bytes24(after), comment): (Bytes24, Bytes24, u8),
+) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_writer_comment_char_auto_quote(usize_vec_to_u8_vec(v)) {
+    match property_writer_comment_char_auto_quote(tail, after, comment) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
@@ -453,33 +524,30 @@ fn cc_writer_comment_char_auto_quote(v: Vec<usize>) -> Option<bool> {
 }
 
 fn cc_byte_record_eq_matches_fields(
-    (base, sa, sb, trunc): (Vec<usize>, Vec<usize>, Vec<usize>, usize),
+    (Bytes24(base), Splits5(sa), Splits5(sb), trunc): (Bytes24, Splits5, Splits5, u8),
 ) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_byte_record_eq_matches_fields(
-        usize_vec_to_u8_vec(base),
-        usize_vec_to_u8_vec(sa),
-        usize_vec_to_u8_vec(sb),
-        usize_to_u8(trunc),
-    ) {
+    match property_byte_record_eq_matches_fields(base, sa, sb, trunc) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
     }
 }
 
-fn cc_comment_only_at_record_start(v: Vec<usize>) -> Option<bool> {
+fn cc_comment_only_at_record_start(
+    (Bytes24(first), Bytes24(tail), comment): (Bytes24, Bytes24, u8),
+) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_comment_only_at_record_start(usize_vec_to_u8_vec(v)) {
+    match property_comment_only_at_record_start(first, tail, comment) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
     }
 }
 
-fn cc_deserialize_byte_buf_accepts_non_utf8(v: Vec<usize>) -> Option<bool> {
+fn cc_deserialize_byte_buf_accepts_non_utf8(Bytes24(v): Bytes24) -> Option<bool> {
     CC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    match property_deserialize_byte_buf_accepts_non_utf8(usize_vec_to_u8_vec(v)) {
+    match property_deserialize_byte_buf_accepts_non_utf8(v) {
         PropertyResult::Pass => Some(true),
         PropertyResult::Fail(_) => Some(false),
         PropertyResult::Discard => None,
@@ -519,10 +587,9 @@ fn run_crabcheck_property(property: &str) -> Outcome {
     let metrics = Metrics { inputs, elapsed_us };
     let status = match result.status {
         crabcheck_qc::ResultStatus::Finished => Ok(()),
-        crabcheck_qc::ResultStatus::Failed { arguments } => Err(format!(
-            "crabcheck counterexample: ({})",
-            arguments.join(" ")
-        )),
+        crabcheck_qc::ResultStatus::Failed { arguments } => {
+            Err(format!("({})", arguments.join(" ")))
+        },
         crabcheck_qc::ResultStatus::TimedOut => Err("crabcheck timed out".into()),
         crabcheck_qc::ResultStatus::GaveUp => Err(format!(
             "crabcheck gave up: passed={}, discarded={}",
@@ -539,9 +606,11 @@ fn run_crabcheck_property(property: &str) -> Outcome {
 static HG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn hegel_settings() -> HegelSettings {
-    HegelSettings::new().test_cases(200).seed(Some(0x0C5F_A7E7))
+    HegelSettings::new().test_cases(40_000_000)
 }
 
+// Hegel's max_size is inclusive, proptest's 0..N is exclusive,
+// so proptest 0..24 corresponds to max_size(23), etc.
 fn run_hegel_property(property: &str) -> Outcome {
     if property == "All" {
         return run_all(run_hegel_property);
@@ -553,9 +622,10 @@ fn run_hegel_property(property: &str) -> Outcome {
         "ResetClearsOutputPosition" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(24));
-                if let PropertyResult::Fail(m) = property_reset_clears_output_position(v) {
-                    panic!("{m}");
+                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let v_cex = v.clone();
+                if let PropertyResult::Fail(_) = property_reset_clears_output_position(v) {
+                    panic!("({:?})", v_cex);
                 }
             })
             .settings(settings.clone())
@@ -565,10 +635,11 @@ fn run_hegel_property(property: &str) -> Outcome {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let v = tc.draw(
-                    hgen::vecs(hgen::vecs(hgen::integers::<u8>()).max_size(6)).max_size(5),
+                    hgen::vecs(hgen::vecs(hgen::integers::<u8>()).max_size(5)).max_size(4),
                 );
-                if let PropertyResult::Fail(m) = property_trim_all_applies_without_headers(v) {
-                    panic!("{m}");
+                let v_cex = v.clone();
+                if let PropertyResult::Fail(_) = property_trim_all_applies_without_headers(v) {
+                    panic!("({:?})", v_cex);
                 }
             })
             .settings(settings.clone())
@@ -577,9 +648,15 @@ fn run_hegel_property(property: &str) -> Outcome {
         "WriterCommentCharAutoQuote" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(24));
-                if let PropertyResult::Fail(m) = property_writer_comment_char_auto_quote(v) {
-                    panic!("{m}");
+                let tail = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let after = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let comment = tc.draw(hgen::integers::<u8>());
+                let tail_cex = tail.clone();
+                let after_cex = after.clone();
+                if let PropertyResult::Fail(_) =
+                    property_writer_comment_char_auto_quote(tail, after, comment)
+                {
+                    panic!("({:?} {:?} {})", tail_cex, after_cex, comment);
                 }
             })
             .settings(settings.clone())
@@ -588,14 +665,17 @@ fn run_hegel_property(property: &str) -> Outcome {
         "ByteRecordEqMatchesFields" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let base = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(16));
+                let base = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
                 let splits_a = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(4));
                 let splits_b = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(4));
                 let trunc_b = tc.draw(hgen::integers::<u8>());
-                if let PropertyResult::Fail(m) =
+                let base_cex = base.clone();
+                let splits_a_cex = splits_a.clone();
+                let splits_b_cex = splits_b.clone();
+                if let PropertyResult::Fail(_) =
                     property_byte_record_eq_matches_fields(base, splits_a, splits_b, trunc_b)
                 {
-                    panic!("{m}");
+                    panic!("({:?} {:?} {:?} {})", base_cex, splits_a_cex, splits_b_cex, trunc_b);
                 }
             })
             .settings(settings.clone())
@@ -604,9 +684,15 @@ fn run_hegel_property(property: &str) -> Outcome {
         "CommentOnlyAtRecordStart" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(24));
-                if let PropertyResult::Fail(m) = property_comment_only_at_record_start(v) {
-                    panic!("{m}");
+                let first = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let tail = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let comment = tc.draw(hgen::integers::<u8>());
+                let first_cex = first.clone();
+                let tail_cex = tail.clone();
+                if let PropertyResult::Fail(_) =
+                    property_comment_only_at_record_start(first, tail, comment)
+                {
+                    panic!("({:?} {:?} {})", first_cex, tail_cex, comment);
                 }
             })
             .settings(settings.clone())
@@ -615,11 +701,12 @@ fn run_hegel_property(property: &str) -> Outcome {
         "DeserializeByteBufAcceptsNonUtf8" => {
             Hegel::new(|tc: hegel::TestCase| {
                 HG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(24));
-                if let PropertyResult::Fail(m) =
+                let v = tc.draw(hgen::vecs(hgen::integers::<u8>()).max_size(23));
+                let v_cex = v.clone();
+                if let PropertyResult::Fail(_) =
                     property_deserialize_byte_buf_accepts_non_utf8(v)
                 {
-                    panic!("{m}");
+                    panic!("({:?})", v_cex);
                 }
             })
             .settings(settings.clone())
@@ -646,7 +733,7 @@ fn run_hegel_property(property: &str) -> Outcome {
                     Metrics::default(),
                 );
             }
-            Err(format!("hegel found counterexample: {msg}"))
+            Err(msg.strip_prefix("Property test failed: ").unwrap_or(&msg).to_string())
         }
     };
     (status, metrics)

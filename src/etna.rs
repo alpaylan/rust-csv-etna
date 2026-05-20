@@ -150,17 +150,52 @@ pub fn property_trim_all_applies_without_headers(fields: Vec<Vec<u8>>) -> Proper
 // Regression for 0f64d3f — without the `requires_quotes[comment] = true` entry
 // in `WriterBuilder::build`, a field starting with `#` serialized unquoted and
 // round-tripped as a comment (lost).
+//
+// Inputs (widened):
+//   tail:         arbitrary bytes for the rest of the comment-prefixed field
+//   after_tail:   arbitrary bytes for the trailing partner field
+//   comment_byte: which byte is configured as the comment character
+//
+// We pick a printable, non-CSV-special byte for `comment_byte` (skipping
+// `,`, `"`, `\r`, `\n`) so the reader can actually be configured with it,
+// and force the first field to start with that byte to keep the
+// auto-quote requirement in scope.
 // ──────────────────────────────────────────────────────────────────────────
-pub fn property_writer_comment_char_auto_quote(tail: Vec<u8>) -> PropertyResult {
+fn pick_comment_byte(b: u8) -> u8 {
+    // Restrict to a wide pool of printable ASCII non-CSV-special bytes so each
+    // PBT trial actually exercises the auto-quote codepath. Skipping the
+    // delimiter (`,`), quote (`"`), CR/LF, and the byte itself if alphanumeric
+    // would collide with field bodies.
+    const POOL: &[u8] = &[
+        b'#', b'%', b'!', b'@', b'$', b'^', b'&', b'*', b'+', b'=', b'~',
+        b'/', b'\\', b'|', b'<', b'>', b'?', b':', b';', b'.',
+    ];
+    POOL[(b as usize) % POOL.len()]
+}
+
+pub fn property_writer_comment_char_auto_quote(
+    tail: Vec<u8>,
+    after_tail: Vec<u8>,
+    comment_byte: u8,
+) -> PropertyResult {
+    let comment = pick_comment_byte(comment_byte);
     let tail = normalize_field(&tail);
-    // Build a field `#...` that starts with the comment char.
-    let mut field = vec![b'#'];
+    let after_norm = normalize_field(&after_tail);
+    // Force the after-field to be non-empty and not start with the comment byte
+    // so it round-trips losslessly under the same comment config.
+    let after = if after_norm.is_empty() || after_norm.first() == Some(&comment) {
+        b"after".to_vec()
+    } else {
+        after_norm
+    };
+    // Build a field that starts with the comment char.
+    let mut field = vec![comment];
     field.extend_from_slice(&tail);
 
     let mut wtr = WriterBuilder::new()
-        .comment(Some(b'#'))
+        .comment(Some(comment))
         .from_writer(Vec::new());
-    if let Err(e) = wtr.write_record(&[&field[..], b"after".as_slice()]) {
+    if let Err(e) = wtr.write_record(&[&field[..], &after[..]]) {
         return PropertyResult::Fail(format!("write error: {e}"));
     }
     let buf = match wtr.into_inner() {
@@ -169,10 +204,10 @@ pub fn property_writer_comment_char_auto_quote(tail: Vec<u8>) -> PropertyResult 
     };
 
     // Round-trip: read back with the same comment char configured. If the field
-    // was not quoted, the reader treats the `#...` row as a comment and skips it.
+    // was not quoted, the reader treats the `<comment>...` row as a comment and skips it.
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
-        .comment(Some(b'#'))
+        .comment(Some(comment))
         .from_reader(buf.as_slice());
     let mut rec = ByteRecord::new();
     let ok = match rdr.read_byte_record(&mut rec) {
@@ -183,8 +218,8 @@ pub fn property_writer_comment_char_auto_quote(tail: Vec<u8>) -> PropertyResult 
     };
     if !ok {
         return PropertyResult::Fail(format!(
-            "no record read back (raw={:?}) — field starting with '#' was not quoted",
-            buf
+            "no record read back (raw={:?}) — field starting with comment byte {:?} was not quoted",
+            buf, comment as char
         ));
     }
     if rec.len() != 2 {
@@ -199,6 +234,13 @@ pub fn property_writer_comment_char_auto_quote(tail: Vec<u8>) -> PropertyResult 
             "round-trip mismatch on field 0: {:?} vs {:?}",
             rec.get(0),
             field
+        ));
+    }
+    if rec.get(1) != Some(&after[..]) {
+        return PropertyResult::Fail(format!(
+            "round-trip mismatch on field 1: {:?} vs {:?}",
+            rec.get(1),
+            after
         ));
     }
     PropertyResult::Pass
@@ -274,16 +316,36 @@ pub fn property_byte_record_eq_matches_fields(
 // Regression for a5745ba — the NFA transition for the comment character was
 // present in `StartField`, so a field starting with `#` (mid-record) was also
 // treated as a comment. The fix moved the transition to `StartRecord`.
+//
+// Inputs (widened):
+//   first:        bytes for the first field (must not start with comment byte)
+//   tail:         bytes after the comment-prefix in the second field
+//   comment_byte: which byte is configured as the comment character
 // ──────────────────────────────────────────────────────────────────────────
-pub fn property_comment_only_at_record_start(tail: Vec<u8>) -> PropertyResult {
-    let comment: u8 = b'#';
+pub fn property_comment_only_at_record_start(
+    first: Vec<u8>,
+    tail: Vec<u8>,
+    comment_byte: u8,
+) -> PropertyResult {
+    let comment = pick_comment_byte(comment_byte);
+    let first_norm = normalize_field(&first);
+    // The first field must not start with the comment byte (otherwise the
+    // comment-at-record-start *is* legitimately matched — a different code
+    // path). Force a fallback when the random first field is empty or starts
+    // with the comment byte.
+    let first_field = if first_norm.is_empty() || first_norm.first() == Some(&comment) {
+        b"first".to_vec()
+    } else {
+        first_norm
+    };
     let tail = normalize_field(&tail);
 
-    // Build `first,#<tail>\n` — the second field starts with `#` but that's
-    // mid-record, so `#` must be treated as a normal byte.
+    // Build `<first>,<comment><tail>\n` — the second field starts with the
+    // comment byte but that's mid-record, so it must be treated as a normal byte.
     let mut second = vec![comment];
     second.extend_from_slice(&tail);
-    let mut data = b"first,".to_vec();
+    let mut data = first_field.clone();
+    data.push(b',');
     data.extend_from_slice(&second);
     data.push(b'\n');
 
@@ -309,10 +371,11 @@ pub fn property_comment_only_at_record_start(tail: Vec<u8>) -> PropertyResult {
             data
         ));
     }
-    if rec.get(0) != Some(b"first".as_slice()) {
+    if rec.get(0) != Some(first_field.as_slice()) {
         return PropertyResult::Fail(format!(
-            "field 0 mismatch: {:?}",
-            rec.get(0)
+            "field 0 mismatch: {:?} vs expected {:?}",
+            rec.get(0),
+            first_field
         ));
     }
     if rec.get(1) != Some(second.as_slice()) {
